@@ -131,7 +131,7 @@ async function scrapeReddit(term, { postLimit = 15, commentPosts = 5, commentsPe
 
 // ---------- LinkedIn (via a RapidAPI provider, public posts only) ----------
 // ---------- LinkedIn (via RapidAPI provider, public post search) ----------
-async function scrapeLinkedIn(term, { pages = 1, datePosted = "past_week" } = {}) {
+async function scrapeLinkedIn(term, { pages = 1 } = {}) {
     const host = process.env.LINKEDIN_API_HOST;
     const key = process.env.LINKEDIN_API_KEY;
     const base = process.env.LINKEDIN_API_URL; // full endpoint URL, no query string
@@ -139,7 +139,7 @@ async function scrapeLinkedIn(term, { pages = 1, datePosted = "past_week" } = {}
   
     const rows = [];
     for (let page = 1; page <= pages; page++) {
-      const url = `${base}?keyword=${encodeURIComponent(term)}&date_posted=${datePosted}&sort_by=date_posted&page=${page}`;
+      const url = `${base}?keyword=${encodeURIComponent(term)}&sort_by=date_posted&page=${page}`;
       const res = await fetch(url, { headers: { "x-rapidapi-host": host, "x-rapidapi-key": key } });
       if (!res.ok) throw new Error(`LinkedIn API ${res.status}: ${(await res.text()).slice(0, 200)}`);
       const json = await res.json();
@@ -168,10 +168,111 @@ async function scrapeLinkedIn(term, { pages = 1, datePosted = "past_week" } = {}
   }
 
 
+  // ---------- Facebook (via RapidAPI, public post search) ----------
+// ---------- Facebook (via RapidAPI, public post search) ----------
+async function scrapeFacebook(term, { pages = 1 } = {}) {
+  const host = process.env.FACEBOOK_API_HOST;
+  const key = process.env.FACEBOOK_API_KEY;
+  const base = process.env.FACEBOOK_API_URL;
+  if (!host || !key || !base) throw new Error("Set FACEBOOK_API_HOST, FACEBOOK_API_KEY and FACEBOOK_API_URL");
+
+  const rows = [];
+  let cursor = "";
+  for (let page = 1; page <= pages; page++) {
+    const url = `${base}?query=${encodeURIComponent(term)}${cursor ? `&end_cursor=${encodeURIComponent(cursor)}` : ""}`;
+    const res = await fetch(url, { headers: { "x-rapidapi-host": host, "x-rapidapi-key": key } });
+    if (!res.ok) throw new Error(`Facebook API ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+
+    const items = json.data?.items || [];
+
+    for (const p of items) {
+      const info = p.basic_info || {};
+      const fb = p.feedback_details || {};
+      const owner = p.owner_info || {};
+
+      rows.push({
+        id: `facebook_${info.post_id}`,
+        platform: "Facebook",
+        source: owner.owner_name || "Facebook",
+        author: owner.owner_name || "unknown",
+        // this endpoint returns no post date, so use the fetch time
+        timestamp: new Date().toISOString(),
+        organization: term,
+        text: String(info.post_text || "").slice(0, 2000),
+        likes: fb.reaction_count ?? 0,
+        replies: fb.total_comments ?? 0,
+        url: info.url,
+        type: "post",
+      });
+    }
+
+    cursor = json.data?.page_info?.cursor || "";
+    if (!cursor || items.length === 0) break;
+    await sleep(500);
+  }
+  return rows.filter((r) => r.text && r.id !== "facebook_undefined");
+}
+
+// ---------- X / Twitter (via RapidAPI, public post search) ----------
+async function scrapeX(term, { pages = 1 } = {}) {
+  const host = process.env.X_API_HOST;
+  const key = process.env.X_API_KEY;
+  const base = process.env.X_API_URL;
+  if (!host || !key || !base) throw new Error("Set X_API_HOST, X_API_KEY and X_API_URL");
+
+  const rows = [];
+  let cursor = "";
+  for (let page = 1; page <= pages; page++) {
+    const url = `${base}?query=${encodeURIComponent(term)}&type=Top${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+
+    const res = await fetch(url, { headers: { "x-rapidapi-host": host, "x-rapidapi-key": key } });
+    if (!res.ok) throw new Error(`X API ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+
+    const items = Array.isArray(json.data)
+  ? json.data
+  : json.data?.items || json.data?.tweets || json.tweets || [];
+for (const item of items) {
+  const c = item.content ?? item;
+      if (!c?.id) continue;
+      rows.push({
+        id: `x_${c.id}`,
+        platform: "X",
+        source: `@${c.author?.username}`,
+        author: c.author?.name || c.author?.username || "unknown",
+        timestamp: c.createdAt,
+        organization: term,
+        text: String(c.text || "").slice(0, 2000),
+        likes: c.likeCount ?? 0,
+        replies: c.replyCount ?? 0,
+        url: `https://x.com/${c.author?.username}/status/${c.id}`,
+        type: c.type === "quote" ? "quote" : "post",
+      });
+    }
+
+    cursor = json.pagination?.nextCursor || "";
+    if (!cursor || items.length === 0) break;
+    await sleep(500);
+  }
+  return rows.filter((r) => r.text);
+}
+
+
+
+const SCRAPERS = {
+  linkedin: ["LinkedIn", scrapeLinkedIn],
+  facebook: ["Facebook", scrapeFacebook],
+  x: ["X", scrapeX],
+};
+
+
+
 // ---------- API ----------
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 // GET /api/collect?terms=Acme,Globex&sources=reddit,hn
+// GET /api/collect?terms=AI,Nike&sources=linkedin,facebook
 app.get("/api/collect", async (req, res) => {
   const terms = String(req.query.terms || "")
     .split(",")
@@ -183,19 +284,19 @@ app.get("/api/collect", async (req, res) => {
     return res.status(400).json({ error: "Pass at least one term, e.g. ?terms=Acme,Globex" });
   }
 
-//   const sources = String(req.query.sources || "hn").split(",");
-const sources = String(req.query.sources || "linkedin").split(",");
+  const sources = String(req.query.sources || "linkedin")
+    .split(",")
+    .map((s) => s.trim().toLowerCase());
 
+  const pages = Math.min(Number(req.query.pages) || 1, 3);
   const rows = [];
   const errors = [];
 
   for (const term of terms) {
-    const jobs = [];
-     // if (sources.includes("hn")) jobs.push(["Hacker News", scrapeHackerNews(term)]);
-     if (sources.includes("linkedin")) {
-        const pages = Math.min(Number(req.query.pages) || 1, 3);
-        jobs.push(["LinkedIn", scrapeLinkedIn(term, { pages })]);
-      }
+    const jobs = sources
+      .filter((s) => SCRAPERS[s])
+      .map((s) => [SCRAPERS[s][0], SCRAPERS[s][1](term, { pages })]);
+
     const results = await Promise.allSettled(jobs.map(([, p]) => p));
     results.forEach((r, i) => {
       const name = jobs[i][0];
@@ -217,5 +318,6 @@ const sources = String(req.query.sources || "linkedin").split(",");
 
   res.json({ count: data.length, data, errors });
 });
+
 
 app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
